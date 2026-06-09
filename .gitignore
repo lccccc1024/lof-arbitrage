@@ -1,0 +1,22 @@
+# CodeGraph 本地索引缓存
+.codegraph/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# 输出目录
+output/
+output_*.csv
+
+# IDE 配置
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统文件
+Thumbs.db
+.DS_Store
