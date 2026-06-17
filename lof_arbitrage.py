@@ -29,17 +29,22 @@ LOF 基金套利检测工具
 
 import csv
 import json
+import logging
 import os
 import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
+from threading import Lock
 from typing import Optional
 
 # Windows 终端 UTF-8 支持
-if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if sys.platform == "win32":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import pandas as pd
 import requests
@@ -68,7 +73,32 @@ MAX_WORKERS = 6
 DEFAULT_SUBSCRIBE_FEE = 0.015   # 1.5%
 DEFAULT_REDEEM_FEE = 0.005      # 0.5%
 
-OUTPUT_DIR = "output"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR = os.path.join(SCRIPT_DIR, "output")
+
+
+def _setup_logging() -> None:
+    """配置文件日志：output/lof_arbitrage_YYYYMMDD.log（仅文件，不含终端）"""
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    log_path = os.path.join(OUTPUT_DIR, f"lof_arbitrage_{date.today():%Y%m%d}.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-5s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[logging.FileHandler(log_path, encoding="utf-8")],
+    )
+
+
+def _emit(level: int, msg: str, *args) -> None:
+    """同时输出到终端（print）和日志文件（logging）。终端编码由 reconfigure 保障。"""
+    if args:
+        formatted = msg % args
+    else:
+        formatted = msg
+    # 根据级别自动添加中文前缀
+    prefix = {logging.ERROR: "[错误] ", logging.WARNING: "[警告] "}.get(level, "")
+    print(prefix + formatted)
+    logging.log(level, msg, *args)
 
 
 def _request_with_retry(
@@ -78,17 +108,19 @@ def _request_with_retry(
     headers: Optional[dict] = None,
     timeout: int = 15,
     max_retries: int = 2,
+    encoding: Optional[str] = "utf-8",
 ) -> requests.Response:
-    """带重试的 GET 请求，最后一次失败则向上抛异常。"""
+    """带重试的 GET 请求。encoding=None 则由 requests 自动检测（用于 HTML 页面）。"""
     for attempt in range(max_retries + 1):
         try:
             resp = requests.get(url, params=params, headers=headers, timeout=timeout)
-            resp.encoding = "utf-8"
+            if encoding is not None:
+                resp.encoding = encoding
             return resp
         except requests.RequestException as e:
             if attempt == max_retries:
                 raise
-            print(f"  [重试 {attempt + 1}/{max_retries}] {e}")
+            _emit(logging.INFO, "  [重试 %d/%d] %s", attempt + 1, max_retries, e)
             time.sleep(2 ** attempt)
 
 
@@ -117,13 +149,18 @@ def fetch_lof_list() -> pd.DataFrame:
         try:
             resp = _request_with_retry(QUOTE_URL, params=params, headers=HEADERS, timeout=15)
             data = resp.json()
-        except Exception as e:
-            print(f"[错误] 获取 LOF 基金行情列表失败 (第{page}页): {e}")
+        except (requests.RequestException, json.JSONDecodeError, ValueError, KeyError) as e:
+            _emit(logging.ERROR, "获取 LOF 基金行情列表失败 (第%d页): %s", page, e)
             if page == 1:
                 sys.exit(1)
             break  # 后续页失败则用已获取的数据
 
-        items = data.get("data", {}).get("diff", []) or data.get("data", {}).get("list", [])
+        if not isinstance(data, dict):
+            if page == 1:
+                _emit(logging.ERROR, "LOF 行情接口返回格式异常")
+                sys.exit(1)
+            break
+        items = (data.get("data") or {}).get("diff") or (data.get("data") or {}).get("list") or []
         if not items:
             break
 
@@ -137,7 +174,7 @@ def fetch_lof_list() -> pd.DataFrame:
         time.sleep(0.3)
 
     if not all_items:
-        print("[警告] 未获取到 LOF 基金数据，接口可能变更")
+        _emit(logging.WARNING, "未获取到 LOF 基金数据，接口可能变更")
         return pd.DataFrame()
 
     records = []
@@ -156,7 +193,6 @@ def fetch_lof_list() -> pd.DataFrame:
 
     df = pd.DataFrame(records)
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
-    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
     df = df.dropna(subset=["price"])
     df = df[df["price"] > 0]  # 排除停牌/无成交（价格为 0）
     return df
@@ -177,14 +213,17 @@ def get_qdii_lof_codes() -> list[str]:
         end = text.rindex("]") + 1
         arr = json.loads(text[start:end])
 
+        # 基金代码前缀（排除 A 股股票代码 00/002/003/30/60/68）
+        FUND_PREFIXES = ("15", "16", "18", "50", "51", "56", "58")
+
         codes = []
         for item in arr:
             code, _, _, ftype, _ = item
-            if "QDII" in ftype or "海外" in ftype:
+            if ("QDII" in ftype or "海外" in ftype) and code.startswith(FUND_PREFIXES):
                 codes.append(code)
         return codes
     except Exception as e:
-        print(f"  [警告] 获取 QDII 基金分类数据失败: {e}")
+        _emit(logging.WARNING, "获取 QDII 基金分类数据失败: %s", e)
         return []
 
 
@@ -200,7 +239,7 @@ def fetch_qdii_lof_quotes() -> pd.DataFrame:
     if not codes:
         return pd.DataFrame()
 
-    print(f"  -> QDII/海外类型基金: {len(codes)} 只，正在批量查询行情 ...")
+    _emit(logging.INFO, "  -> QDII/海外类型基金: %d 只，正在批量查询行情 ...", len(codes))
 
     # 上交所基金代码 500000–599999
     SH_PREFIX_START = "5"
@@ -228,26 +267,25 @@ def fetch_qdii_lof_quotes() -> pd.DataFrame:
                 timeout=15,
             )
             data = resp.json()
-            items = data.get("data", {}).get("diff", []) or data.get(
-                "data", {}
-            ).get("list", [])
+            if not isinstance(data, dict):
+                continue
+            items = (data.get("data") or {}).get("diff") or (data.get("data") or {}).get("list") or []
             for item in items:
                 code = str(item.get("f12", ""))
                 name = item.get("f14", "")
                 price = item.get("f2")
-                if code and name and price not in (None, "-"):
+                if code and name and price and price != "-":
+                    amt_raw = item.get("f6", 0)
+                    if not amt_raw or amt_raw == "-":
+                        amt_raw = 0
                     records.append({
                         "code": code,
                         "name": name,
                         "price": float(price),
-                        "amount": float(
-                            item.get("f6", 0)
-                            if item.get("f6") not in (None, "-")
-                            else 0
-                        ),
+                        "amount": float(amt_raw),
                     })
-        except Exception as e:
-            print(f"    [警告] 第{i // batch_size + 1}批查询失败: {e}")
+        except (requests.RequestException, json.JSONDecodeError, ValueError, KeyError) as e:
+            _emit(logging.WARNING, "    第%d批查询失败: %s", i // batch_size + 1, e)
         time.sleep(0.3)
 
     if not records:
@@ -255,7 +293,6 @@ def fetch_qdii_lof_quotes() -> pd.DataFrame:
 
     df = pd.DataFrame(records)
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
-    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
     df = df.dropna(subset=["price"])
     df = df[df["price"] > 0]  # 排除停牌/无成交（价格为 0）
     return df
@@ -275,7 +312,7 @@ def fetch_nav(code: str) -> Optional[float]:
                     nav_date = datetime.strptime(nav_date_str, "%Y-%m-%d").date()
                     days_old = (date.today() - nav_date).days
                     if days_old > 2:
-                        print(f"  [警告] {code} 净值日期 {nav_date_str}（{days_old} 天前），可能已过期")
+                        _emit(logging.WARNING, "  %s 净值日期 %s（%d 天前），可能已过期", code, nav_date_str, days_old)
                 except ValueError:
                     pass
             return float(lsjz[0]["DWJZ"])
@@ -294,7 +331,7 @@ def fetch_fees(code: str) -> tuple[Optional[float], Optional[float], str]:
     """
     url = FEE_URL_TPL.format(code)
     try:
-        resp = _request_with_retry(url, headers=HEADERS, timeout=10)
+        resp = _request_with_retry(url, headers=HEADERS, timeout=10, encoding=None)
         html = resp.text
     except requests.RequestException:
         return None, None, "未知"
@@ -429,12 +466,23 @@ def print_summary(results: list[dict]):
         return
 
     # --- 全部基金 ---
-    print(f"\n>> 全部 {len(df)} 只 LOF 基金 (按折溢价率排序)")
+    print(f"\n>> 全部 {len(df)} 只 LOF 基金 (溢价 Top 10 / 折价 Top 10)")
     print(f"    {'代码':>6}  {'名称':<22}  {'价格':>8}  {'净值':>8}  {'溢价率%':>7}  {'类型':<8}")
     print(f"    {dash}")
 
     sorted_df = df.sort_values("premium_rate", ascending=False, na_position="last")
-    for _, r in sorted_df.head(15).iterrows():
+    for _, r in sorted_df.head(10).iterrows():
+        prem = f"{r['premium_rate']:+.2f}" if pd.notna(r["premium_rate"]) else "   N/A"
+        nav_s = f"{r['nav']:.4f}" if pd.notna(r["nav"]) else "   N/A"
+        at = (r["arbitrage_type"] if pd.notna(r["arbitrage_type"])
+              and r["arbitrage_type"] != "无" else "")
+        print(f"    {r['code']:>6}  {r['name']:<22}  {r['price']:>8.4f}  {nav_s:>8}  {prem:>7}  {at:<8}")
+
+    # 折价 Top 10
+    bottom = sorted_df.tail(10)
+    if len(sorted_df) > 20:
+        print(f"    {'...':>6}  {'(中间省略)':<22}")
+    for _, r in bottom.iterrows():
         prem = f"{r['premium_rate']:+.2f}" if pd.notna(r["premium_rate"]) else "   N/A"
         nav_s = f"{r['nav']:.4f}" if pd.notna(r["nav"]) else "   N/A"
         at = (r["arbitrage_type"] if pd.notna(r["arbitrage_type"])
@@ -467,42 +515,43 @@ def print_summary(results: list[dict]):
 
 
 def main() -> None:
+    _setup_logging()
     today = date.today().strftime("%Y%m%d")
     start = time.time()
 
-    print(f"\n{'='*50}")
-    print(f"  LOF 基金套利检测")
-    print(f"  {datetime.now():%Y-%m-%d %H:%M}")
-    print(f"{'='*50}")
+    _emit(logging.INFO, "=" * 50)
+    _emit(logging.INFO, "  LOF 基金套利检测  %s", datetime.now().strftime("%Y-%m-%d %H:%M"))
+    _emit(logging.INFO, "=" * 50)
 
     # -- 1. 获取 LOF 基金行情（含 QDII-LOF）--
-    print("\n[1/5] 获取 LOF 基金行情列表 (东方财富 MK0025) ...")
+    _emit(logging.INFO, "[1/5] 获取 LOF 基金行情列表 (东方财富 MK0025) ...")
     lof_df = fetch_lof_list()
-    print(f"  -> 获取到 {len(lof_df)} 只 LOF 基金")
+    _emit(logging.INFO, "  -> 获取到 %d 只 LOF 基金", len(lof_df))
 
     if lof_df.empty:
-        print("[退出] 未获取到 LOF 基金数据。")
+        _emit(logging.ERROR, "[退出] 未获取到 LOF 基金数据。")
         sys.exit(1)
 
     # -- 1b. 补充 QDII-LOF 基金行情 --
-    print("\n[2/5] 获取 QDII-LOF 基金行情 (分类 JS + ulist.np) ...")
+    _emit(logging.INFO, "[2/5] 获取 QDII-LOF 基金行情 (分类 JS + ulist.np) ...")
     qdii_df = fetch_qdii_lof_quotes()
 
     if qdii_df.empty:
-        print("  -> 未获取到 QDII-LOF 基金")
+        _emit(logging.INFO, "  -> 未获取到 QDII-LOF 基金")
     else:
-        print(f"  -> 获取到 {len(qdii_df)} 只 QDII-LOF 基金（有场内交易的）")
+        _emit(logging.INFO, "  -> 获取到 %d 只 QDII-LOF 基金（有场内交易的）", len(qdii_df))
 
         combined = pd.concat([lof_df, qdii_df], ignore_index=True)
-        combined = combined.drop_duplicates(subset="code", keep="first")  # MK0025 条目优先于 QDII 来源
-        print(f"  -> 合并后共 {len(combined)} 只基金（去重）")
+        combined = combined.drop_duplicates(subset="code", keep="first")
+        _emit(logging.INFO, "  -> 合并后共 %d 只基金（去重）", len(combined))
         lof_df = combined
 
     funds = lof_df.to_dict("records")
 
     # -- 2. 获取净值 --
-    print("\n[3/5] 获取基金净值 (天天基金) ...")
+    _emit(logging.INFO, "[3/5] 获取基金净值 (天天基金) ...")
     nav_ok = 0
+    nav_lock = Lock()
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         fut_map = {pool.submit(fetch_nav, f["code"]): f for f in funds}
         for fut in as_completed(fut_map):
@@ -510,21 +559,23 @@ def main() -> None:
             nav = fut.result()
             f["nav"] = nav
             if nav:
-                nav_ok += 1
-    print(f"  -> 净值获取成功 {nav_ok}/{len(funds)}")
+                with nav_lock:
+                    nav_ok += 1
+    _emit(logging.INFO, "  -> 净值获取成功 %d/%d", nav_ok, len(funds))
 
     valid = [f for f in funds if f.get("nav") is not None]
-    print(f"  -> 有净值数据的 LOF: {len(valid)} 只")
+    _emit(logging.INFO, "  -> 有净值数据的 LOF: %d 只", len(valid))
 
     if not valid:
-        print("[退出] 无有效净值数据。")
+        _emit(logging.ERROR, "[退出] 无有效净值数据。")
         sys.exit(1)
 
     # -- 3. 获取费率 --
-    print("\n[4/5] 获取基金费率 (东方财富) ...")
+    _emit(logging.INFO, "[4/5] 获取基金费率 (东方财富) ...")
     fee_ok = 0
     sub_defaults = 0
     red_defaults = 0
+    fee_lock = Lock()
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         fut_map = {pool.submit(fetch_fees, f["code"]): f for f in valid}
         for fut in as_completed(fut_map):
@@ -534,35 +585,49 @@ def main() -> None:
                 f["subscribe_fee"] = sub_fee
             else:
                 f["subscribe_fee"] = DEFAULT_SUBSCRIBE_FEE
-                sub_defaults += 1
+                with fee_lock:
+                    sub_defaults += 1
             if red_fee is not None:
                 f["redeem_fee"] = red_fee
             else:
                 f["redeem_fee"] = DEFAULT_REDEEM_FEE
-                red_defaults += 1
+                with fee_lock:
+                    red_defaults += 1
             f["sub_status"] = sub_status
             if sub_fee is not None and red_fee is not None:
-                fee_ok += 1
+                with fee_lock:
+                    fee_ok += 1
+
     parts = [f"全部解析 {fee_ok}/{len(valid)}"]
     if sub_defaults:
         parts.append(f"申购费率默认 {sub_defaults}")
     if red_defaults:
         parts.append(f"赎回费率默认 {red_defaults}")
-    print(f"  -> 费率获取完成 ({'; '.join(parts)})")
-    if sub_defaults or red_defaults:
-        print(f"  ⚠ 部分基金使用默认费率（申购 {DEFAULT_SUBSCRIBE_FEE*100:.1f}% / 赎回 {DEFAULT_REDEEM_FEE*100:.1f}%），可能造成套利假阴性")
+    _emit(logging.INFO, "  -> 费率获取完成 (%s)", "; ".join(parts))
+
+    # 费率解析大面积失败告警
+    if sub_defaults > len(valid) * 0.5 or red_defaults > len(valid) * 0.5:
+        _emit(logging.WARNING,
+            "  ⚠ 超过一半基金使用默认费率！东方财富费率页面可能已改版，请检查正则表达式"
+        )
+    elif sub_defaults or red_defaults:
+        _emit(logging.INFO,
+            "  ⚠ 部分基金使用默认费率（申购 %.1f%% / 赎回 %.1f%%），可能造成套利假阴性",
+            DEFAULT_SUBSCRIBE_FEE * 100,
+            DEFAULT_REDEEM_FEE * 100,
+        )
 
     # -- 4. 计算 + 输出 --
-    print("\n[5/5] 计算套利机会 ...")
+    _emit(logging.INFO, "[5/5] 计算套利机会 ...")
     results = [calc_arbitrage(f) for f in valid]
 
     csv_path = save_csv(results, today)
-    print(f"  -> CSV: {csv_path}")
+    _emit(logging.INFO, "  -> CSV: %s", csv_path)
 
     print_summary(results)
 
     elapsed = time.time() - start
-    print(f"  耗时 {elapsed:.1f}s\n")
+    _emit(logging.INFO, "  耗时 %.1fs\n", elapsed)
 
 
 if __name__ == "__main__":

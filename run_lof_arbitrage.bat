@@ -1,55 +1,61 @@
 @echo off
-chcp 65001 >nul
-title LOF基金套利检测工具
+title LOF Arbitrage Scanner
 
-:: /AUTO 模式：用于计划任务自动运行，跳过所有 pause
 set AUTO_MODE=0
 if /i "%~1"=="/AUTO" set AUTO_MODE=1
 
 echo ====================================
-echo  LOF 基金套利检测工具
+echo   LOF Arbitrage Scanner
 echo ====================================
 echo.
 
 cd /d "%~dp0"
 
 if not exist "lof_arbitrage.py" (
-    echo [错误] 未找到 lof_arbitrage.py
-    echo 请确保本脚本与 lof_arbitrage.py 在同一目录下。
+    echo [ERROR] lof_arbitrage.py not found
+    echo Please place this script next to lof_arbitrage.py
     if "%AUTO_MODE%"=="0" pause
     exit /b 1
 )
 
-echo [1/2] 检查 Python 环境...
+echo [1/3] Checking Python ...
 where python >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [错误] 未找到 Python，请确认已安装并加入 PATH。
+    echo [ERROR] Python not found. Install Python and add to PATH.
     if "%AUTO_MODE%"=="0" pause
     exit /b 1
 )
-
 python --version
 
 echo.
-echo [2/2] 开始运行...
+echo [2/3] Checking dependencies ...
+python -c "import pandas, requests" >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [ERROR] Missing dependencies. Run: pip install pandas requests
+    if "%AUTO_MODE%"=="0" pause
+    exit /b 1
+)
+
+echo.
+echo [3/3] Running ...
 echo.
 
 python lof_arbitrage.py
 
 if %errorlevel% equ 0 (
     echo.
-    echo 运行完成！CSV 文件已保存到 output 目录。
+    echo Done! Check output/ for log and CSV files.
     if "%AUTO_MODE%"=="0" (
         echo.
-        echo 按任意键退出...
+        echo Press any key to exit...
         pause >nul
     )
 ) else (
     echo.
-    echo [错误] 脚本执行失败，请检查上方错误信息。
+    echo [ERROR] Script failed. Check messages above.
     if "%AUTO_MODE%"=="0" (
         echo.
-        echo 按任意键退出...
+        echo Press any key to exit...
         pause >nul
     )
 )
